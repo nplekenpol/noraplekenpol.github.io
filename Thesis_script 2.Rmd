@@ -1,0 +1,914 @@
+---
+title: "Masterthesis script"
+author: "Nora Plekenpol"
+date: "28-06-2024"
+output:
+  pdf_document: default
+  word_document: default
+  html_document: default
+params:
+  pwd:
+    label: Enter the Password, please!
+    value: ''
+    input: password
+---
+
+## **Inhoudsopgave**
+
+[1. Verzamelen van de data via AmCAT]
+
+[2. Data preprocessing]
+
+[3. Codeboek]
+
+[4. Versturen naar annotinder]
+
+[5. Intercoder reliability berekenen]
+
+[6. Validatie dataset aanmaken]
+
+[7. Automatische classificaties]
+
+[8. Beschrijvende statistiek]
+
+[9. Controlevariabelen toevoegen]
+
+[10. Hypothesetoetsing]
+
+```{r}
+library(amcatr)
+library(httr)
+library(tidyverse)
+library(boolydict)
+library(tidytext)
+library(annotinder)
+library(dplyr)
+library(stringr)
+library(tidyr)
+library(irr)
+library(caret)
+library(zoo)
+library(lmtest)
+library(magrittr)
+library(readr)
+library(lubridate)
+library(psych)  
+library(sjPlot)
+library(ggplot2)
+```
+
+------------------------------------------------------------------------
+
+## 1. Verzamelen van de data via AmCAT
+
+Via AmCAT is middels een query een dataset aangemaakt. Deze articleset kan worden opgehaald en opgeslagen worden via de code hieronder.
+
+```{r, eval = FALSE}
+
+# Connecten met Amcat
+conn <- amcat.connect("https://vu.amcat.nl")
+
+#Dataset ophalen
+femicidedataset2 <- amcat.getarticlemeta(conn, project=191, articleset=8157, columns = c("date", "title", "text", "publisher", "url"))
+view(femicidedataset2)
+
+# Opslaan als CSV-bestand
+write.csv(femicidedataset2, file = "femicidedataset_15-05.csv", row.names = FALSE)
+```
+
+## 2. Data preprocessing
+
+De opgehaalde data is verder gefilterd en opgeschoond met behulp van Boolydict. Hieronder worden de nieuwsberichten opgesplitst in paragrafen. Daarna wordt er een query opgesteld, zodat alleen paragrafen behouden worden waarin de query voorkomt. Daarbij zijn alleen de zin of zinnen rondom de vindplaats behouden (context=30). Deze dataset wordt gebruikt voor de tekstanalyses.
+
+```{r, eval = FALSE}
+
+df <- read_csv("~/Documents/Master 2023:2034/Scriptie/R code/femicidedataset_15-05.csv")
+
+#Teksten transformeren naar paragrafen en tokeniseren
+tokens <- df |> 
+  mutate(text=str_c(title, text, sep = "\n\n")) |>
+  unnest_paragraphs(output=text, input=text, to_lower=F) |>   
+  group_by(id) |> 
+  mutate(parnr=row_number())  |>
+  ungroup() |>
+  unnest_sentences(output=text, input=text, to_lower=F) |>
+  group_by(id) |> 
+  mutate(sentnr=row_number())  |>
+  ungroup() |>
+  unnest_tokens(output=word, input=text, to_lower = F, strip_punct=F) |>
+  mutate(index=row_number())  
+
+# Query definieren
+femicide = '(femicide* OR vrouwenmoord OR partnergeweld OR partnermoord* OR familiedrama* OR gezinsdrama* OR "crime passionel" OR "crime passionnel" OR eerwraak)'
+moord = "(*moord* OR *dood*  OR neergeschoten OR *gestoken OR geslagen OR gewurgd OR omgebracht)"
+vrouw = "(vrouw OR moeder OR echtgenote OR vriendin)"
+man = "(man OR partner OR ex-partner OR echtgenoot)"
+query = glue::glue("{femicide} OR <{moord} {vrouw} {man}>~30")
+
+# dict_match geeft de index van elke vindplaats (ankerwoord)
+hits = tokens |> dict_match(query, text_col = "word", mode="terms", context_col = "id", index_col="index")
+
+# Functie om de tekst rond een vindplaatse te selecteren
+get_context <- function(tokens, target_index, context=30) {
+  doc_id <- tokens |> filter(index == target_index) |> pull(id)
+  doc = tokens |> filter(id == doc_id)
+  min_sent = doc |> filter(index >= (target_index - context)) |> pull(sentnr) |> min() 
+  max_sent = doc |> filter(index <= (target_index + context)) |> pull(sentnr) |> max() 
+
+doc |> filter(sentnr >= min_sent, sentnr <= max_sent) |>
+    mutate(word = if_else(index == target_index, str_c("`", word, "`"), word)) |>
+    pull(word) |>
+    str_c(collapse=" ")
+}
+
+# Functie uitvoeren op alle vindplaatsen (data_index) en samen binden naar een nieuwe tibble
+texts <- hits |>
+  pull(data_index) |>
+  purrr::map(function(ix) tibble(index=ix, text=get_context(tokens, ix)), .progress = T) |>
+  bind_rows()
+
+texts <- texts |>
+  left_join(select(tokens, index, id)) |>
+  left_join(select(df, -text)) |>
+  relocate(text, .after=last_col())
+
+# Rijen met dubbele ID's verwijderen
+texts <- texts[!duplicated(texts$id), ]
+
+testdata <- texts %>%
+  select(id, text)
+
+#Oplaan als CSV
+write.csv(testdata, file = "~/Documents/Master 2023:2034/Scriptie/R code/testdata.csv", row.names = FALSE)
+```
+
+## 3. Codeboek
+
+De handmatige annotatie wordt in AnnoTinder gedaan. Hiervoor moet een codeboek opgesteld worden. Dit codeboek wordt in de volgende stap naar AnnoTinder verstuurd, zodat er via daar geclassificeerd kan worden.
+
+```{r}
+#Hypothese 1
+q_relevantie = question('Relevantie', 
+                      type = 'annotinder', 
+                      codes=list(
+                        code('ja'),
+                        code('nee', makes_irrelevant = "REMAINING")
+                      ), 
+                      question = 'Gaat dit artikel over een (poging tot) moord op een vrouw door een (ex-)partner?')
+
+#Hypothese 2a
+q_slachtofferbeschuldiging_direct = question('Slachtofferbeschuldiging direct', 
+                      type = 'annotinder', 
+                      codes=c('ja', 'nee'),
+                      question='Wordt het gedrag van het slachtoffer als reden voor de moord gegeven?')
+
+#Hypothese 2b
+
+q_slachtofferbeschuldiging_indirect = question('Slachtofferbeschuldiging indirect', 
+                              type = 'annotinder', 
+                              codes=c('ja', 'nee'), 
+                              question='Wordt de emotie van de dader benoemd?')
+
+#Hypothese 2c
+q_romantisering = question('Romantiseringsframe', 
+                      type = 'annotinder', 
+                      codes=c('ja', 'nee'), 
+                      question='Wordt er gebruikt gemaakt van een romantiserende term?')
+
+codebook = create_codebook(relevantie=q_relevantie, slachtofferbeschuldiging_direct=q_slachtofferbeschuldiging_direct, slachtofferbeschuldiging_indirect=q_slachtofferbeschuldiging_indirect, romantisering=q_romantisering)
+```
+
+## 4. Versturen naar annotinder
+
+Hieronder wordt de opgeschoonde data uit stap 3 en het codeboek uit stap 4 naar AnnoTinder verstuurt als coding job. Een annotator heeft een sample van 300 gecodeerd, maar de tweede annotator heeft een sample van 400 gecodeerd voor de intercoder reliability.
+
+```{r, eval = FALSE}
+texts <- read_csv("~/Documents/Master 2023:2034/Scriptie/R code/testdata.csv")
+  
+#Units definieren
+units <- create_units(texts %>%
+                        sample_n(400), 
+                      id = 'id', 
+                      set_markdown('text', text))
+            
+
+create_job("example", units, codebook) %>%
+  create_job_db(overwrite = T) %>%
+  start_annotator(background = T)
+
+# Job uploaden naar de server
+annotinder::backend_connect("https://uva-climate.up.railway.app", username="noraplekenpol@hotmail.com", .password = params$pwd)
+jobid = annotinder::upload_job("femicide13-05", units, codebook)
+
+# Coderen
+url = glue::glue('https://uva-climate.netlify.app/?host=https%3A%2F%2Fuva-climate.up.railway.app&job_id={jobid}')
+print(url)
+browseURL(url)
+
+annotations = download_annotations(jobid)
+```
+
+## 5. Intercoder reliability berekenen
+
+Toen twee annotators een sample van 100 hadden geclassificeerd, kon de intercoder reliability berekend worden. Hieronder is te zien hoe dat gedaan is.
+
+```{r}
+#Handmatig gecodeerde annotaties ophalen
+df <- read_csv("~/Downloads/annotations_277_femicide13-05.csv.csv")
+
+breed_df <- df %>%
+  filter(coder_id %in% c(2613, 2617)) %>%
+  select(unit_id, variable, coder_id, value) %>%
+  pivot_wider(names_from = c(variable, coder_id),
+              values_from = value)
+
+# Hernoem de kolommen met kolomnummers
+breed_df <- breed_df %>%
+  rename(
+    relevantie1 = `Relevantie_2613`,
+    beschuldiging_direct1 = `Slachtofferbeschuldiging direct_2613`,
+    beschuldiging_indirect1 = `Slachtofferbeschuldiging indirect_2613`,
+    romantisering1 = `Romantiseringsframe_2613`,
+    relevantie2 = `Relevantie_2617`,
+    beschuldiging_direct2 = `Slachtofferbeschuldiging direct_2617`,
+    beschuldiging_indirect2 = `Slachtofferbeschuldiging indirect_2617`,
+    romantisering2 = `Romantiseringsframe_2617`
+  )
+
+#Kappa berekenen
+variable_pairs <- list(
+  c("relevantie1", "relevantie2"),
+  c("beschuldiging_direct1", "beschuldiging_direct2"),
+  c("beschuldiging_indirect1", "beschuldiging_indirect2"),
+  c("romantisering1", "romantisering2")
+)
+
+calculate_kappa <- function(columns) {
+  subset_data <- breed_df[, columns]
+  kappa_result <- kappa2(subset_data, weight = "unweighted")
+  return(kappa_result$value)  # Return the kappa value
+}
+
+kappa_results <- sapply(variable_pairs, calculate_kappa)
+
+names(kappa_results) <- c("Relevantie", "Beschuldiging Direct", "Beschuldiging Indirect", "Romantisering")
+print(kappa_results)
+```
+
+## 6. Validatie dataset aanmaken
+
+De sample van 400 die door de eerste annotator is gecodeerd, is gebruikt om in de volgende stappen de betrouwbaarheidsscores van de automatische classificatie te berekenen. Hieronder wordt deze handmatig geclassificeerde dataset opgehaald en opgeslagen.
+
+```{r}
+# Datasets laden
+data1 <- read_csv("~/Downloads/annotations_277_femicide13-05.csv.csv")
+data2 <- read_csv("~/Downloads/annotations_292_femicide13-05.csv-2.csv")
+texts <- read_csv("~/Documents/Master 2023:2034/Scriptie/R code/testdata.csv")
+
+combined_data <- bind_rows(data1, data2)
+
+databreed <- combined_data %>%
+  filter(coder_id %in% c(2613)) %>%
+  select(unit_id, variable, coder_id, value) %>%
+  pivot_wider(names_from = c(variable, coder_id),
+              values_from = value,
+              values_fn = list(value = ~ .[1]))
+
+validatieset <- inner_join(texts, databreed, by = c("id" = "unit_id"))
+
+validatieset <- validatieset %>%
+  rename(
+    relevantie = `Relevantie_2613`,
+    beschuldiging_direct = `Slachtofferbeschuldiging direct_2613`,
+    beschuldiging_indirect = `Slachtofferbeschuldiging indirect_2613`,
+    romantisering = `Romantiseringsframe_2613`
+  )
+
+validatieset$relevantie <- ifelse(validatieset$relevantie == "ja", 1,
+                                ifelse(validatieset$relevantie == "nee", 0,
+                                       ifelse(validatieset$relevantie == "IRRELEVANT", NA, validatieset$relevantie)))
+
+validatieset$beschuldiging_direct <- ifelse(validatieset$beschuldiging_direct == "ja", 1,
+                                            ifelse(validatieset$beschuldiging_direct == "nee", 0,
+                                                   ifelse(validatieset$beschuldiging_direct == "IRRELEVANT", NA, validatieset$beschuldiging_direct)))
+
+validatieset$beschuldiging_indirect <- ifelse(validatieset$beschuldiging_indirect == "ja", 1,
+                                              ifelse(validatieset$beschuldiging_indirect == "nee", 0,
+                                                     ifelse(validatieset$beschuldiging_indirect == "IRRELEVANT", NA, validatieset$beschuldiging_indirect)))
+
+validatieset$romantisering <- ifelse(validatieset$romantisering == "ja", 1,
+                                     ifelse(validatieset$romantisering == "nee", 0,
+                                            ifelse(validatieset$romantisering == "IRRELEVANT", NA, validatieset$romantisering)))
+
+write.csv(validatieset, "validatieset.csv", row.names = FALSE)
+```
+
+## 7. Automatische classificaties
+
+De automatische classificaties zijn met GPT en BERT gedaan. Hieronder is voor beide LLM's een voorbeeldcode te zien. De prompts die gebruikt zijn, zijn te zien de bijlagen van de scriptie. Er dient een eigen API ingevoerd te worden. De codes zijn eerst gebruikt voor de validatieset. Uit betrouwbaarheidsscores bleek BERT het best te presteren voor H1 en GPT voor H2a, H2b en H2c. Daarom is daarna de code van BERT gebruikt voor het filteren van relevante data en GPT voor het classificeren van stigmatiserende nieuwsberichten.
+
+**GPT**
+
+```{r, eval = FALSE}
+
+validatieset <- read_csv("~/Documents/Master 2023:2034/Scriptie/R code/validatieset.csv")
+
+my_API <- "API KEY HIER"
+
+#Model laden
+hey_chatGPT <- function(answer_my_question) {
+  chat_GPT_answer <- POST(
+    url = "https://api.openai.com/v1/chat/completions",
+    add_headers(Authorization = paste("Bearer", my_API)),
+    content_type_json(),
+    encode = "json",
+    body = list(
+      model = "gpt-4o",
+      temperature = 0,
+      messages = list(
+        list(
+          role = "user",
+          content = answer_my_question
+        )
+      )
+    )
+  )
+  str_trim(content(chat_GPT_answer)$choices[[1]]$message$content)
+}
+
+# GPT kolom aanmaken voor resultaten
+validatieset$gpt_relevantie <- NA
+
+# Prompt 
+for (i in 1:nrow(validatieset)) {
+  print(i)
+  question <- prompt <- "PROMPT"
+  text <- validatieset[i,2]       
+  concat <- paste(question, text)
+  result <- hey_chatGPT(concat)
+  while(length(result) == 0){
+    result <- hey_chatGPT(concat)
+    print(result)
+  }
+  print(result)
+  validatieset$gpt_relevantie[i] <- result
+}
+
+validatieset_totaal <- read_csv("Documents/Master 2023:2034/Scriptie/R code/validatieset_totaal.csv")
+
+# Definieer de metrics functie
+metrics <- function(d, human_column, gpt_column) {
+  tp <- sum(d[[gpt_column]] == 1 & d[[human_column]] == 1)
+  tn <- sum(d[[gpt_column]] == 0 & d[[human_column]] == 0)
+  fp <- sum(d[[gpt_column]] == 1 & d[[human_column]] == 0)
+  fn <- sum(d[[gpt_column]] == 0 & d[[human_column]] == 1)
+  
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  pr <- if_else(tp + fp == 0, 0, tp / (tp + fp))
+  re <- if_else(tp + fn == 0, 0, tp / (tp + fn))
+  f1 <- if_else(pr + re == 0, 0, 2 * pr * re / (pr + re))
+  
+  tibble(accuracy = accuracy, pr = pr, re = re, f1 = f1)
+}
+
+# Bereken de scores voor 'relevantie' en 'gpt_relevantie'
+scores_h1 <- metrics(validatieset, "relevantie", "gpt_relevantie")
+
+# Bekijk de scores
+print(scores_h1)
+```
+
+**BERT**
+
+```{python, eval = FALSE}
+import pandas as pd
+import numpy as np
+from pathlib import Path
+from transformers import (AutoModelForSequenceClassification, TrainingArguments, DataCollatorWithPadding,
+                          AutoTokenizer, TrainingArguments, Trainer)
+from sklearn.metrics import classification_report
+
+from sklearn.model_selection import StratifiedKFold
+import torch, gc
+
+import datasets
+
+
+df = pd.read_csv("train_h1.csv").rename(columns={"relevantie":"label"})
+print(df.head())
+print(df.label.value_counts())
+
+train_selection = np.random.rand(len(df)) < 0.85
+dataset = datasets.DatasetDict({
+        "train": datasets.Dataset.from_pandas(df[train_selection]),
+        "test": datasets.Dataset.from_pandas(df[~train_selection])
+    })
+print(dataset)
+
+MODEL = "FremyCompany/roberta-large-nl-oscar23"
+
+tokenizer = AutoTokenizer.from_pretrained(MODEL)
+
+def preprocess_function(examples):
+    return tokenizer(examples["text"], truncation=True, padding=True)
+
+dataset = dataset.map(preprocess_function, batched=True)
+data_collator = DataCollatorWithPadding(tokenizer=tokenizer)
+
+id2label = {0: 'no_femicide', 1: 'femicide'}
+label2id = {lbl: id for (id, lbl) in id2label.items()}
+
+model = AutoModelForSequenceClassification.from_pretrained(
+    MODEL, num_labels=2, id2label=id2label, label2id=label2id
+)
+
+training_arguments = TrainingArguments(
+    output_dir=str("femicide_model"),
+    learning_rate=2e-5,
+    per_device_train_batch_size=8,  # Verlaag de batch size naar 8
+    per_device_eval_batch_size=48,
+    num_train_epochs=5,
+    weight_decay=0.01,
+    fp16=True,
+    fp16_full_eval=True,
+    evaluation_strategy="epoch",
+    save_strategy="epoch",
+    load_best_model_at_end=True,
+    push_to_hub=False,
+)
+
+def compute_metrics(eval_pred):
+    metric = datasets.load_metric('f1')
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    return metric.compute(predictions=predictions, references=labels, average="macro")
+
+trainer = Trainer(
+            model,
+            training_arguments,
+            train_dataset=dataset["train"],
+            eval_dataset=dataset["test"],
+            data_collator=data_collator,
+            tokenizer=tokenizer,
+            compute_metrics=compute_metrics,
+    )
+    
+trainer.train()
+
+# stop learning
+model = model.eval()
+
+# Get predictions
+test_data = dataset['test']
+predictions = trainer.predict(test_data)
+
+# Assuming 'label' is the correct field name for the true labels in test_data
+true_labels = test_data['label'][:]
+predicted_labels = np.argmax(predictions.predictions, axis=-1)
+
+# Create DataFrame for comparison
+preds = pd.DataFrame({'true': true_labels, 'pred': predicted_labels})
+
+# Print classification report
+print(classification_report(preds['true'], preds['pred']))
+```
+
+## 8. Beschrijvende statistiek {data-link="8. Automatische classificaties"}
+
+In deze stap zijn alle plots gemaakt die de verdeling van de data weergeven.
+
+```{r}
+library(readr)
+combined_counts <- read_csv("nieuwsperdag9juni.csv")
+combined <- read_csv("combined.csv")
+
+# ROLLING SUM VAN AANTAL NIEUWSBERICHTEN
+combined_counts$h1_rollingsum <- rollapply(combined_counts$h1, width = 7, FUN = sum, align = "right", fill = NA, partial = FALSE)
+combined_counts$h1_rollingsum_maand <- rollapply(combined_counts$h1, width = 31, FUN = sum, align = "right", fill = NA, partial = FALSE)
+combined_counts$h2a_rollingsum <- rollapply(combined_counts$h2a, width = 7, FUN = sum, align = "right", fill = NA, partial = FALSE)
+combined_counts$h2b_rollingsum <- rollapply(combined_counts$h2b, width = 7, FUN = sum, align = "right", fill = NA, partial = FALSE)
+combined_counts$h2c_rollingsum <- rollapply(combined_counts$h2c, width = 7, FUN = sum, align = "right", fill = NA, partial = FALSE)
+
+combined_counts$h2_rollingsum <- combined_counts$h2a_rollingsum + combined_counts$h2b_rollingsum + combined_counts$h2c_rollingsum
+
+combined_counts$h2_rollingsum_maand <- rollapply(combined_counts$h2_rollingsum, width = 31, FUN = sum, align = "right", fill = NA, partial = FALSE)
+
+
+test <- merge(combined_counts, combined[, c("datum", "meldingen_utrecht_s", "meldingen_middenbrabant_s")], by = "datum", all.x = TRUE)
+
+write.csv(test, file = "9junianalyses4.csv", row.names = FALSE)
+
+# MELDINGEN BIJ ELKAAR OP TELLEN
+analyse <- read_csv("ANALYSE/9junianalyses.csv")
+
+analyse$meldingen_totaal <- analyse$meldingen_middenbrabant_s + analyse$meldingen_utrecht_s
+
+# GRAFIEK MAKEN PER MAAND
+analyse$datum <- ymd(analyse$datum)
+
+df <- analyse %>%
+  mutate(jaar_maand = floor_date(datum, "month"))
+
+resultaat <- df %>%
+  group_by(jaar_maand) %>%
+  summarise(
+    h1 = sum(h1, na.rm = TRUE),
+    h2a = sum(h2a, na.rm = TRUE),
+    h2b = sum(h2b, na.rm = TRUE),
+    h2c = sum(h2c, na.rm = TRUE),
+    meldingen_totaal = sum(meldingen_totaal, na.rm = TRUE)
+  )
+
+resultaat$h2 <- resultaat$h2a + resultaat$h2b + resultaat$h2c
+
+resultaat <- resultaat %>%
+  mutate(
+    h1_std = as.numeric(scale(h1)),
+    h2_std = as.numeric(scale(h2)),
+    meldingen_totaal_std = as.numeric(scale(meldingen_totaal))
+  )
+
+data_monthly <- read_csv("data_monthly.csv")
+
+resultaat <- merge(resultaat, data_monthly, by.x = "jaar_maand", by.y = "maand", all.x = TRUE)
+
+data2 <- read_csv("data2.csv")
+
+analyse <- analyse %>%
+  left_join(select(data2, datum, meldingen_utrecht, meldingen_middenbrabant), by = "datum")
+
+#GECOMBINEERD STD
+ggplot(data = resultaat, aes(x = jaar_maand)) +
+  geom_line(aes(y = h1_std, color = "Aantal nieuwsberichten per maand")) +
+  geom_line(aes(y = meldingen_totaal_std, color = "Aantal meldingen per maand")) +
+  geom_line(aes(y = h2_std, color = "Aantal stigmatiserende nieuwsberichten per maand")) +
+  scale_color_manual(values = c("Aantal nieuwsberichten per maand" = "purple", "Aantal meldingen per maand" = "pink", "Aantal stigmatiserende nieuwsberichten per maand" = "orange")) +
+  labs(title = "Gestandaardiseerde plot",
+       x = "Datum",
+       y = "Gestandaardiseerde waarden",
+       color = "Legenda") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#H1
+ggplot(data = resultaat, aes(x = jaar_maand)) +
+  geom_line(aes(y = h1, color = "Aantal nieuwsberichten per maand")) +
+  scale_color_manual(values = c("Aantal nieuwsberichten per maand" = "purple")) +
+  labs(title = "Aantal nieuwsberichten per maand",
+       x = "Datum",
+       y = "Aantal nieuwsberichten per maand",
+       color = "Legenda") +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#H2
+ggplot(resultaat, aes(x = jaar_maand)) +
+  geom_line(aes(y = h2, color = "Stigmatiserende framing"), size = 0.5) +
+  labs(title = "Aantallen per maand voor alle variabelen",
+       x = "Maand",
+       y = "Aantal") +
+  scale_color_manual(name = "Type framing",
+                     values = c("Stigmatiserende framing" = "purple")) + 
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+# MELDINGEN
+ggplot(resultaat, aes(x = jaar_maand)) +
+  geom_line(aes(y = meldingen_middenbrabant, color = "Midden-Brabant"), size = 0.5) +
+  geom_line(aes(y = meldingen_utrecht, color = "Utrecht"), size = 0.5) +
+  labs(title = "Aantal Meldingen Midden-Brabant en Utrecht per Maand (2019-2023)",
+       x = "Datum",
+       y = "Aantal meldingen") +
+  scale_x_date(date_breaks = "1 year", date_labels = "%Y") +
+  scale_color_manual(name = "Veilig Thuis regio",
+                     values = c("Midden-Brabant" = "purple", "Utrecht" = "orange")) +
+  theme_minimal() +
+  theme(legend.position = "bottom")
+
+#GEMIDDELDEN
+sum(resultaat$h1)
+sum(resultaat$h2a)
+sum(resultaat$h2b)
+sum(resultaat$h2c)
+
+#AANDEEL STIGMATISEREND
+stig <- read_csv("gptclassificatie.csv")
+
+sum(rowSums(stig[, c("gpt_beschuldiging_indirect", "gpt_beschuldiging_direct", "gpt_romantisering")]) > 0)
+
+#GEMIDEELDE MELINDGEN
+analyse$weekdag <- factor(wday(analyse$datum, label = TRUE), levels=c("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"))
+
+# Meldingen voor Utrecht en Midden-Brabant bij elkaar optellen
+analyse$utr_bra <- analyse$meldingen_utrecht + analyse$meldingen_middenbrabant
+
+# NA-waarden behandelen als 0 voor de gemiddelde berekening
+analyse$utr_bra[is.na(analyse$utr_bra)] <- 0
+
+# Data samenvatten per dag en het gemiddelde berekenen
+gemiddelde_per_dag <- analyse %>%
+  group_by(weekdag) %>%
+  summarise(gemiddelde_meldingen = mean(utr_bra))
+
+# Gemiddelde aantal meldingen per dag voor Utrecht
+gemiddelde_per_dag_utrecht <- analyse %>%
+  group_by(weekdag) %>%
+  summarise(gemiddelde_meldingen_utrecht = mean(meldingen_utrecht, na.rm = TRUE))
+
+# Gemiddelde aantal meldingen per dag voor Midden-Brabant
+gemiddelde_per_dag_middenbrabant <- analyse %>%
+  group_by(weekdag) %>%
+  summarise(gemiddelde_meldingen_middenbrabant = mean(meldingen_middenbrabant, na.rm = TRUE))
+
+# Weekdagen in het Nederlands
+nederlandse_weekdagen <- c("Ma", "Di", "Wo", "Do", "Vr", "Za", "Zo")
+
+# Plot maken met Nederlandse weekdagen
+plot <- ggplot(gemiddelde_per_dag, aes(x=weekdag, y=gemiddelde_meldingen)) +
+  geom_bar(stat="identity", fill="purple") +
+  labs(x="Weekdag", y="Gemiddeld aantal meldingen", title="Gemiddeld aantal meldingen per dag regio Utrecht en Midden-Brabant") +
+  theme_minimal() +
+  theme(legend.position="none") +
+  scale_x_discrete(labels = nederlandse_weekdagen)
+
+print(plot)
+
+analyse <- read_csv("analyse_totaal.csv")
+
+print(colnames(analyse))
+
+analyse <- analyse[-1, ]
+
+analyse$h2_rollingsum <- analyse$h2a_rollingsum + analyse$h2b_rollingsum + analyse$h2c_rollingsum
+
+analyse$perc_stig <- analyse$h2_rollingsum / analyse$h1_rollingsum * 100
+analyse$perc_stig[is.nan(analyse$perc_stig)] <- 0
+
+#CORRELATIE TABEL
+selected_vars <- analyse[, c("h1_rollingsum", "perc_stig", "meldingen_totaal", "meldingen_lag7", "meldingen_week", "meldingen_lag1")]
+
+correlation_table <- round(cor(selected_vars), 2)
+
+add_p_values <- function(cor_matrix, data) {
+  p_values <- matrix(NA, nrow = ncol(cor_matrix), ncol = ncol(cor_matrix))
+  for (i in 1:ncol(cor_matrix)) {
+    for (j in 1:ncol(cor_matrix)) {
+      p_values[i, j] <- cor.test(data[[i]], data[[j]])$p.value
+    }
+  }
+  rownames(p_values) <- colnames(p_values) <- colnames(cor_matrix)
+  return(p_values)
+}
+
+p_values <- add_p_values(correlation_table, selected_vars)
+
+correlation_table_with_p_values <- correlation_table
+for (i in 1:nrow(correlation_table)) {
+  for (j in 1:ncol(correlation_table)) {
+    if (p_values[i, j] < 0.001) {
+      correlation_table_with_p_values[i, j] <- paste0(correlation_table_with_p_values[i, j], "***")
+    } else if (p_values[i, j] < 0.01) {
+      correlation_table_with_p_values[i, j] <- paste0(correlation_table_with_p_values[i, j], "**")
+    } else if (p_values[i, j] < 0.05) {
+      correlation_table_with_p_values[i, j] <- paste0(correlation_table_with_p_values[i, j], "*")
+    }
+  }
+}
+
+print(correlation_table_with_p_values)
+
+
+#M EN SD
+summary_stats <- sapply(analyse[c("h1_rollingsum", "perc_stig", "meldingen_totaal", "meldingen_lag7", "meldingen_week", "meldingen_lag1")], function(x) c(mean = mean(x), sd = sd(x)))
+print(summary_stats)
+```
+
+## 9. Controlevariabelen toevoegen
+
+In deze stap zijn alle variabelen toegevoegd die controleren voor patronen in de tijd.
+
+```{r}
+analyse <- read_csv("9junianalyses4.csv")
+
+analyse$meldingen_totaal <- analyse$meldingen_middenbrabant_s + analyse$meldingen_utrecht_s
+
+#LAG 7
+analyse <- analyse %>%
+  mutate(meldingen_lag7 = lag(meldingen_totaal, n = 7))
+
+analyse <- analyse %>%
+  mutate(dag = weekdays(datum))
+
+#ROLLING SUM VORIGE WEEK
+analyse <- analyse %>%
+  mutate(meldingen_week = rollapply(meldingen_totaal, width = 7, FUN = function(x) sum(ifelse(is.na(x), 0, x)), align = "right", fill = NA, partial = TRUE)) %>%
+  mutate(meldingen_week = lag(meldingen_week, 1))
+
+#ALLE NA's ERUIT (EN WEEKEND, OMDAT DIT NIET KLOPPEND IS)
+analyse <- analyse %>% filter(!is.na(meldingen_totaal))
+
+analyse <- analyse %>% 
+  filter(meldingen_totaal != 0 & !(dag %in% c("Saturday", "Sunday")))
+
+analyse <- analyse %>% filter(!is.na(meldingen_lag7))
+
+#LAG 1
+analyse <- analyse %>%
+  mutate(meldingen_lag1 = lag(meldingen_totaal, n = 1))
+
+write.csv(analyse, file = "analyse_totaal.csv", row.names = FALSE)
+```
+
+## 10. Hypothesetoetsing
+
+De hypothesetoetsing is gedaan op vier tijdsniveaus. Hieronder is te zien hoe dit gedaan is.
+
+```{r}
+analyse <- read_csv("analyse_totaal.csv")
+
+#CUMULATIEF WEEK
+analyse$perc_stig_week <- analyse$h2_rollingsum / analyse$h1_rollingsum * 100
+analyse$perc_stig_week[is.nan(analyse$perc_stig_week)] <- 0
+
+h1_1 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1, data = analyse)
+h1_2 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1 + h1_rollingsum, data = analyse)
+h1_3 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1 + h1_rollingsum + perc_stig_week + h1_rollingsum:perc_stig_week, data = analyse)
+
+summary(h1_1)
+summary(h1_2)
+summary(h1_3)
+
+tab_model(h1_1, h1_2, h1_3, show.std = TRUE)
+
+#CUMULATIEF MAAND
+
+analyse <- analyse[-c(1:30), ]
+
+analyse$perc_stig_maand <- analyse$h2_rollingsum_maand / analyse$h1_rollingsum_maand * 100
+analyse$perc_stig_maand[is.nan(analyse$perc_stig_maand)] <- 0
+
+h4_1 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1, data = analyse)
+h4_2 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1 + h1_rollingsum_maand, data = analyse)
+h4_3 <- lm(meldingen_totaal ~ meldingen_week + meldingen_lag7 + meldingen_lag1 + h1_rollingsum_maand + perc_stig_maand + h1_rollingsum:perc_stig_maand, data = analyse)
+
+summary(h4_1)
+summary(h4_2)
+summary(h4_3)
+
+tab_model(h1_1, h1_2, h1_3, show.std = TRUE)
+
+#WEEKNIVEAU
+analyse <- read_csv("9junianalyses.csv")
+
+
+analyse$h2 <- analyse$h2a + analyse$h2b + analyse$h2c
+analyse$meldingen_totaal <- analyse$meldingen_middenbrabant_s + analyse$meldingen_utrecht_s
+
+analyse$datum <- as.Date(analyse$datum, format="%Y-%m-%d")
+
+analyse$week <- floor_date(analyse$datum, "week")
+
+weekly_data <- analyse %>%
+  group_by(week) %>%
+  summarise(
+    h1_sum = sum(h1, na.rm = TRUE),
+    h2_sum = sum(h2, na.rm = TRUE),
+    meldingen_totaal = sum(meldingen_totaal, na.rm = TRUE)
+  )
+
+weekly_data$perc_stig <- weekly_data$h2_sum / weekly_data$h1_sum * 100
+weekly_data$perc_stig[is.nan(weekly_data$perc_stig)] <- 0
+
+h2_1 <- lm(meldingen_totaal ~ h1_sum, data = weekly_data)
+summary(h2_1)
+
+h2_2 <- lm(meldingen_totaal ~ h1_sum + perc_stig + h1_sum:perc_stig, data = weekly_data)
+summary(h2_2)
+
+tab_model(h2_1, h2_2, show.std = TRUE)
+
+#MAANDNIVEAU
+Ijsselland.data <- read_csv("ijsselland.csv")
+
+Ijsselland.data <- Ijsselland.data[-1, ]
+Ijsselland.data <- Ijsselland.data[-((nrow(Ijsselland.data)-1):nrow(Ijsselland.data)), ]
+Ijsselland.data <- Ijsselland.data[-nrow(Ijsselland.data), ]
+
+colnames(Ijsselland.data) <- c("Maand", "2019", "2020", "2021", "2022", "2023")
+
+# Verwijder mogelijke witte spaties rondom de maandnamen
+Ijsselland.data$Maand <- trimws(Ijsselland.data$Maand)
+
+# Controleer unieke maandnamen na trimmen
+print(unique(Ijsselland.data$Maand))
+
+# Zet de dataset om naar long format
+Ijsselland_long <- Ijsselland.data %>%
+  pivot_longer(cols = starts_with("20"), names_to = "Jaar", values_to = "Waarde")
+
+# Mapping van Nederlandse naar Engelse maandnamen
+maand_mapping <- c(
+  "Januari" = "January",
+  "Februari" = "February",
+  "Maart" = "March",
+  "April" = "April",
+  "Mei" = "May",
+  "Juni" = "June",
+  "Juli" = "July",
+  "Augustus" = "August",
+  "September" = "September",
+  "Oktober" = "October",
+  "November" = "November",
+  "December" = "December"
+)
+
+# Maandkolom omzetten naar Engels (gebruik volledige maandnamen)
+Ijsselland_long$Maand <- maand_mapping[trimws(Ijsselland_long$Maand)]
+
+# Controleer unieke maandnamen na mapping
+print(unique(Ijsselland_long$Maand))
+
+# Maak een nieuwe kolom met de startdata voor elke maand
+Ijsselland_long <- Ijsselland_long %>%
+  mutate(Datum = as.Date(paste(Jaar, Maand, "01", sep = "-"), format = "%Y-%B-%d"))
+
+# Controleer de resulterende data
+print(head(Ijsselland_long))
+
+combined <- read_csv("combined.csv")
+
+combined$h2 <- combined$variabele_h2a + combined$variabele_h2b + combined$variabele_h2c
+
+subset_combined <- combined %>%
+  select(datum, meldingen_middenbrabant.x, meldingen_utrecht.x, variabele_h1, h2) %>%
+  rename(Datum = datum)
+
+# Controleren op NA-waarden in Datum kolom
+sum(is.na(subset_combined$Datum))
+
+# Maak een nieuwe kolom Maand_Jaar in het formaat "YYYY-MM-01"
+maandelijkse_meldingen <- subset_combined %>%
+  filter(!is.na(Datum)) %>%  # Filter NA's in Datum kolom
+  mutate(Datum = format(Datum, "%Y-%m-01")) %>%  # Datum in het formaat "YYYY-MM-01"
+  group_by(Datum) %>%
+  summarise(
+    meldingen_middenbrabant.x = sum(meldingen_middenbrabant.x, na.rm = TRUE),
+    h2 = sum(h2, na.rm = TRUE),
+    variable_h1 = sum(variabele_h1, na.rm = TRUE),# Summeer en negeer NA's
+    meldingen_utrecht.x = sum(meldingen_utrecht.x, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+# Converteer Datum naar character in Ijsselland.long
+Ijsselland_long <- Ijsselland_long %>%
+  mutate(Datum = as.character(Datum))
+
+# Voer de left join uit op basis van de kolom Datum
+samengevoegd <- Ijsselland_long %>%
+  left_join(maandelijkse_meldingen, by = "Datum")
+
+samengevoegd <- subset(samengevoegd, select = -c(Maand, Jaar))
+
+names(samengevoegd) <- gsub("Waarde", "meldingen_ijsseland", names(samengevoegd))
+names(samengevoegd) <- gsub("meldingen_utrecht\\.x", "meldingen_utrecht", names(samengevoegd))
+names(samengevoegd) <- gsub("meldingen_middenbrabant\\.x", "meldingen_middenbrabant", names(samengevoegd))
+names(samengevoegd) <- gsub("variable_h1", "h1", names(samengevoegd))
+
+new_col_order <- c("Datum", "h1", "h2", 
+                   "meldingen_ijsseland", 
+                   "meldingen_middenbrabant", 
+                   "meldingen_utrecht")
+samengevoegd <- samengevoegd[, new_col_order, drop = FALSE]
+
+standaard_populatie <- 100000
+
+samengevoegd$meldingen_middenbrabant_s <- (samengevoegd$meldingen_middenbrabant / 500000) * standaard_populatie
+
+samengevoegd$meldingen_utrecht_s <- (samengevoegd$meldingen_utrecht / 1354834) * standaard_populatie
+
+samengevoegd$meldingen_ijsselland_s <- (samengevoegd$meldingen_ijsseland / 531342) * standaard_populatie
+
+samengevoegd$meldingen_totaal <- samengevoegd$meldingen_middenbrabant_s + samengevoegd$meldingen_utrecht_s + samengevoegd$meldingen_ijsselland_s
+
+samengevoegd$perc_stig <- samengevoegd$h2 / samengevoegd$h1 * 100
+samengevoegd$perc_stig[is.nan(samengevoegd$perc_stig)] <- 0
+
+h3_1 <- lm(meldingen_totaal ~ h1, data = samengevoegd)
+summary(h3_1)
+
+h3_2 <- lm(meldingen_totaal ~ h1 + perc_stig + h1:perc_stig, data = samengevoegd)
+summary(h3_2)
+
+tab_model(h3_1, h3_2, show.std = TRUE)
+
+# Plot de data en de regressielijn
+plot(samengevoegd$h1, samengevoegd$meldingen_totaal, 
+     main = "Regressieplot van meldingen_totaal vs h1",
+     xlab = "h1",
+     ylab = "meldingen_totaal",
+     pch = 19, col = "blue")
+
+# Voeg de regressielijn toe aan de plot
+abline(h3_1, col = "red", lwd = 2)
+
+```
